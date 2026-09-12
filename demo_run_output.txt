@@ -1,0 +1,93 @@
+
+======================================================================
+STEP 1-3: Dispatcher creates Priority-10 emergency, requests H3
+======================================================================
+{
+  "id": "E001",
+  "origin": "N1",
+  "needs": [
+    "icu",
+    "trauma"
+  ],
+  "priority": 10,
+  "preferred_hospital": "H3",
+  "ambulance_id": "A01"
+}
+
+======================================================================
+STEP 4-7: System checks H3, finds it unsuitable, recommends alternative + shows scores
+======================================================================
+RECOMMENDED HOSPITAL: Government Vellore Medical College Hospital
+RECOMMENDED ROUTE:    Katpadi Junction -> Govt. Medical College (Adukkamparai)
+  ETA 4.2 min | distance 3.16 km | score 71.2
+WARNING: Preferred hospital Vellore Care Multispecialty Hospital cannot be used: no ICU, no trauma capability.
+WHY THIS HOSPITAL? Government Vellore Medical College Hospital has the required facilities available and is currently accepting emergencies.
+WHY THIS ROUTE?    ETA 4.2 min, traffic score 100.0, safety score 79.0, no active incident.
+  Alternative -> CMC Vellore (Christian Medical College) (ETA 9.3 min, score 61.0) - feasible, but slower (9.3 min vs 4.2 min).
+  Alternative -> CMC Vellore (Christian Medical College) (ETA 14.0 min, score 53.7) - feasible, but slower (14.0 min vs 4.2 min).
+  Alternative -> CMC Vellore (Christian Medical College) (ETA 15.2 min, score 47.8) - feasible, but slower (15.2 min vs 4.2 min).
+
+======================================================================
+STEP 8-10: Dispatcher confirms dispatch, ambulance starts moving, green corridor activates
+======================================================================
+  Katpadi Junction -> Govt. Medical College (Adukkamparai)  (+4.2 min, cumulative 4.2 min)  junction N9: priority granted
+
+======================================================================
+STEP 11: Dispatcher opens Chaos Mode, injects an accident on the active route
+======================================================================
+Accident injected on edge R10 (Katpadi-Gudiyatham Road).
+
+======================================================================
+STEP 12-14: System recalculates routes, backup becomes recommended, dispatcher confirms
+======================================================================
+NEW RECOMMENDED ROUTE: Katpadi Junction -> Green Circle (Gandhi Nagar) -> CMC Vellore Campus -> Thorapadi -> Govt. Medical College (Adukkamparai)
+  ETA 26.2 min | score 38.9 | incident on route: False
+  Alternative -> Katpadi Junction -> Green Circle (Gandhi Nagar) -> Vellore Fort -> Thorapadi -> Govt. Medical College (Adukkamparai) (ETA 27.1 min, score 36.8)
+  Alternative -> Katpadi Junction -> Govt. Medical College (Adukkamparai) (ETA 4.2 min, score 30.7)
+
+======================================================================
+STEP 15-16: Updated ETA/route shown, full timestamped history
+======================================================================
+[
+  {
+    "id": "EVT001",
+    "timestamp": "2026-09-12 19:18:32",
+    "event_type": "emergency_created",
+    "message": "Priority-10 emergency created at Katpadi Junction.",
+    "emergency_id": "E001"
+  },
+  {
+    "id": "EVT002",
+    "timestamp": "2026-09-12 19:18:32",
+    "event_type": "hospital_rejected",
+    "message": "Preferred hospital Vellore Care Multispecialty Hospital cannot be used: no ICU, no trauma capability.",
+    "hospital_id": "H3"
+  },
+  {
+    "id": "EVT003",
+    "timestamp": "2026-09-12 19:18:32",
+    "event_type": "recommendation",
+    "message": "Recommended Government Vellore Medical College Hospital via Katpadi Junction -> Govt. Medical College (Adukkamparai) (score 71.2, ETA 4.2 min).",
+    "hospital_id": "H2"
+  },
+  {
+    "id": "EVT004",
+    "timestamp": "2026-09-12 19:18:32",
+    "event_type": "ambulance_dispatched",
+    "message": "Ambulance A01 en route: Katpadi Junction -> Govt. Medical College (Adukkamparai).",
+    "ambulance_id": "A01"
+  },
+  {
+    "id": "EVT005",
+    "timestamp": "2026-09-12 19:18:32",
+    "event_type": "chaos_accident",
+    "message": "Accident injected on Katpadi-Gudiyatham Road (R10).",
+    "edge_id": "R10"
+  },
+  {
+    "id": "EVT006",
+    "timestamp": "2026-09-12 19:18:32",
+    "event_type": "reroute_proposed",
+    "message": "New recommended route: Katpadi Junction -> Green Circle (Gandhi Nagar) -> CMC Vellore Campus -> Thorapadi -> Govt. Medical College (Adukkamparai) (score 38.9, ETA 26.2 min)."
+  }
+]
