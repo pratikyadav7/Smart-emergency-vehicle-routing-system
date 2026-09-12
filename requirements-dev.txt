@@ -1,0 +1,3 @@
+# The engine itself is pure standard library (Python 3.9+).
+# This file covers the test suite only.
+pytest>=7.0

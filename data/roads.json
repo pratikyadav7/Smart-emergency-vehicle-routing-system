@@ -1,6 +1,6 @@
 {
   "city": "Vellore, Tamil Nadu",
-  "note": "Node coordinates correspond to real Vellore landmarks/junctions. Road attributes (traffic, safety, capacity, status) are simulated for the hackathon prototype, per the 8-hour build plan (Section 8: Simulation World).",
+  "note": "Node coordinates correspond to real Vellore landmarks/junctions. Road attributes (traffic, safety, capacity, status) are simulated for the hackathon prototype, per the 8-hour build plan (Section 8: Simulation World). Edges R14-R16 add cross-town connectivity so the graph offers genuinely competing routes instead of a single corridor.",
   "nodes": [
     {"id": "N1", "name": "Katpadi Junction",              "lat": 12.9698, "lon": 79.1355},
     {"id": "N2", "name": "VIT Vellore Gate",               "lat": 12.9692, "lon": 79.1559},
@@ -26,6 +26,9 @@
     {"id": "R10", "from": "N1", "to": "N9", "name": "Katpadi-Gudiyatham Road","speed_kmph": 45, "capacity": "high",   "traffic": "low",    "safety": 79, "status": "open"},
     {"id": "R11", "from": "N9", "to": "N7", "name": "Adukkamparai Bypass",    "speed_kmph": 35, "capacity": "medium", "traffic": "low",    "safety": 83, "status": "open"},
     {"id": "R12", "from": "N10","to": "N5", "name": "Bus Stand-CMC Road",     "speed_kmph": 25, "capacity": "low",    "traffic": "high",   "safety": 70, "status": "open"},
-    {"id": "R13", "from": "N7", "to": "N5", "name": "Thorapadi-CMC Road",     "speed_kmph": 30, "capacity": "medium", "traffic": "low",    "safety": 87, "status": "open"}
+    {"id": "R13", "from": "N7", "to": "N5", "name": "Thorapadi-CMC Road",     "speed_kmph": 30, "capacity": "medium", "traffic": "low",    "safety": 87, "status": "open"},
+    {"id": "R14", "from": "N2", "to": "N4", "name": "VIT-Sathuvachari Road",  "speed_kmph": 40, "capacity": "high",   "traffic": "low",    "safety": 81, "status": "open"},
+    {"id": "R15", "from": "N9", "to": "N3", "name": "Adukkamparai Link Road", "speed_kmph": 40, "capacity": "high",   "traffic": "low",    "safety": 82, "status": "open"},
+    {"id": "R16", "from": "N8", "to": "N5", "name": "Bagayam-CMC Road",       "speed_kmph": 30, "capacity": "medium", "traffic": "medium", "safety": 86, "status": "open"}
   ]
 }

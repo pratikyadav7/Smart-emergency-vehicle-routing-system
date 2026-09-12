@@ -1,99 +1,170 @@
 """
-Mandatory end-to-end demo (Section 18 of the build plan), run on the
-Vellore road graph.
+Mandatory end-to-end demo for the Emergency Green-Corridor Planner.
 
-Scenario:
-  Priority-10 emergency, ICU + Trauma required, originates at Katpadi
-  Junction. Dispatcher requests the nearby Vellore Care Multispecialty
-  Hospital (H3), which turns out to lack ICU/trauma. The engine selects
-  a suitable hospital instead. After dispatcher confirmation and ambulance
-  dispatch, Chaos Mode injects an accident on the active route, forcing
-  a reroute.
+Runs the scripted judging scenario from ``data/scenarios/mandatory_demo.json``
+against the real engine - every number printed below is computed, not staged.
 
-Run: python3 demo.py
+    python3 demo.py
+
+Scenario: a Priority-10 patient needing ICU + trauma care is picked up at the
+VIT Vellore Gate. The dispatcher asks for CMC Vellore (H1), but H1 is on
+diversion, so medical eligibility rules it out and a suitable hospital is
+chosen instead. After dispatch the ambulance clears one junction, Chaos Mode
+puts a major accident on the road ahead, and the engine recalculates a backup
+route from the ambulance's current position.
 """
 
 import json
-from backend.routing.engine import RoutingEngine, HistoryLog
+import os
+from typing import Any, Dict
+
+from backend.session import DispatchSession
+
+SCENARIO_PATH = os.path.join(os.path.dirname(__file__), "data", "scenarios", "mandatory_demo.json")
+
+BAR = "=" * 78
 
 
-def line(title):
-    print("\n" + "=" * 70)
-    print(title)
-    print("=" * 70)
+def step(number: str, title: str) -> None:
+    print(f"\n{BAR}\n STEP {number}: {title}\n{BAR}")
 
 
-def show_recommendation(rec):
-    if not rec["hospital"]:
-        print("No feasible hospital/route:", rec["reasons"]["explanation"])
-        return
-    h = rec["hospital"]
-    r = rec["recommended_route"]
-    print(f"RECOMMENDED HOSPITAL: {h['name']}")
-    print(f"RECOMMENDED ROUTE:    {engine.describe_route(r['node_path'])}")
-    print(f"  ETA {r['eta_min']} min | distance {r['distance_km']} km | score {r['score']}")
-    if rec["reasons"]["warning"]:
-        print(f"WARNING: {rec['reasons']['warning']}")
-    print(f"WHY THIS HOSPITAL? {rec['reasons']['why_this_hospital']}")
-    print(f"WHY THIS ROUTE?    {rec['reasons']['why_this_route']}")
-    for alt in rec["alternatives"]:
-        tag = f"{alt['hospital']['name']} via {alt['route']['edge_ids']}"
-        why = rec["reasons"]["why_not_alternatives"].get(tag, "")
-        print(f"  Alternative -> {alt['hospital']['name']} "
-              f"(ETA {alt['route']['eta_min']} min, score {alt['combined_score']}) - {why}")
+def show_route(route: Dict[str, Any], indent: str = "  ") -> None:
+    marker = "RECOMMENDED" if route.get("recommended") else "alternative"
+    print(f"{indent}[{marker}] {route['route_id']} -> {route['hospital_name']}")
+    print(f"{indent}  path      : {' -> '.join(route['node_names'])}")
+    print(f"{indent}  roads     : {', '.join(route['edges'])}")
+    print(f"{indent}  ETA       : {route['eta_minutes']} min over {route['distance_km']} km")
+    print(f"{indent}  conditions: traffic {route['traffic_condition']}, "
+          f"safety {route['safety_score']}, capacity {route['capacity_score']}")
+    if route["incident_impact"]:
+        for incident in route["incident_impact"]:
+            print(f"{indent}  incident  : {incident['severity']} {incident['type']} on "
+                  f"{incident['road_name']} (+{incident['delay_minutes']} min)")
+    print(f"{indent}  SCORE     : {route['score']}")
+
+
+def show_breakdown(route: Dict[str, Any]) -> None:
+    breakdown = route["score_breakdown"]
+    print(f"  Score breakdown for {route['route_id']} "
+          f"(weight profile: {breakdown['profile']}, total {breakdown['total']}):")
+    print(f"    {'component':<22}{'value':>8}{'weight':>9}{'contribution':>14}")
+    for key, value in breakdown["components"].items():
+        print(f"    {key:<22}{value:>8}{breakdown['weights'][key]:>9}"
+              f"{breakdown['contributions'][key]:>14}")
+
+
+def main() -> None:
+    with open(SCENARIO_PATH, encoding="utf-8") as handle:
+        scenario = json.load(handle)
+
+    session = DispatchSession()
+
+    step("0", "Simulation world set up (pre-existing hospital status)")
+    for event in scenario["setup_events"]:
+        result = session.inject_chaos(event)
+        print(f"  {result['event']['message']}")
+
+    # ------------------------------------------------------------------
+    step("1-3", "Dispatcher creates a Priority-10 emergency and requests H1")
+    created = session.create_emergency(scenario["emergency"])
+    print(json.dumps(created["emergency"], indent=2))
+
+    # ------------------------------------------------------------------
+    step("4-5", "Medical eligibility is evaluated BEFORE preference")
+    analysis = session.analyze()
+    for rejected in analysis["eligibility"]["rejected_hospitals"]:
+        print(f"  REJECTED {rejected['hospital_id']}: {rejected['detail']}")
+    for hospital in analysis["eligibility"]["eligible_hospitals"]:
+        print(f"  ELIGIBLE {hospital['id']}: {hospital['name']} "
+              f"(beds {hospital['emergency_beds']}, capabilities {', '.join(hospital['capabilities'])})")
+    print(f"\n  WARNING: {analysis['reasons']['warning']}")
+
+    # ------------------------------------------------------------------
+    step("6-7", "Candidate routes, scores and the recommendation")
+    print(f"  Selected hospital: {analysis['hospital']['name']} "
+          f"({analysis['hospital']['id']}) at {analysis['hospital']['node']}\n")
+    for route in analysis["routes"]:
+        show_route(route)
+        print()
+    show_breakdown(analysis["recommended_route"])
+    print(f"\n  WHY THIS HOSPITAL: {analysis['reasons']['why_this_hospital']}")
+    print(f"  WHY THIS ROUTE   : {analysis['reasons']['why_this_route']}")
+    for route_id, reason in analysis["reasons"]["why_not_alternatives"].items():
+        print(f"  WHY NOT {route_id}  : {reason}")
+
+    # ------------------------------------------------------------------
+    step("8-10", "Dispatcher confirms dispatch; ambulance starts; green corridor activates")
+    confirmed = session.confirm_dispatch()
+    ambulance = confirmed["ambulance"]
+    print(f"  Ambulance {ambulance['ambulance_id']} status {ambulance['status']}, "
+          f"total ETA {ambulance['total_eta_min']} min")
+    print(f"  Route: {' -> '.join(confirmed['confirmed_route']['node_names'])}")
+    print("  Green corridor (SIMULATED - no real traffic infrastructure is controlled):")
+    for junction in confirmed["green_corridor"]["junctions"]:
+        print(f"    {junction['node_id']:<4} {junction['node_name']:<34} {junction['state']}")
+
+    moved = session.advance(scenario["advance_steps_before_chaos"])
+    for movement in moved["movements"]:
+        print(f"\n  MOVE: {movement['from_name']} -> {movement['to_name']} via "
+              f"{movement['road_name']} (+{movement['segment_minutes']} min)")
+    print(f"  Ambulance now at {moved['ambulance']['current_node']}, "
+          f"next junction {moved['ambulance']['next_junction']}, "
+          f"{moved['ambulance']['remaining_eta_min']} min remaining")
+    for junction in moved["green_corridor"]["junctions"]:
+        print(f"    {junction['node_id']:<4} {junction['node_name']:<34} {junction['state']}")
+
+    # ------------------------------------------------------------------
+    step("11", "CHAOS MODE: accident injected on the active route")
+    chaos = session.inject_chaos(scenario["chaos_event"])
+    print(f"  {chaos['event']['message']}")
+    print(f"  Affects the active route: {chaos['affects_active_route']}")
+
+    # ------------------------------------------------------------------
+    step("12-13", "Engine recalculates from the ambulance's current position")
+    reroute = session.reroute()
+    old_route = reroute["old_route"]
+    print(f"  Previous plan (remaining leg): {' -> '.join(old_route['node_names'])} "
+          f"= {old_route['eta_minutes']} min")
+    print("  New recommendation:")
+    show_route(reroute["new_route"], indent="    ")
+    print("\n  Alternatives still available:")
+    for alternative in reroute["alternatives"]:
+        print(f"    {alternative['route_id']}: {' -> '.join(alternative['node_names'])} "
+              f"({alternative['eta_minutes']} min, score {alternative['score']})")
+    print(f"\n  WHY REROUTE: {reroute['reasons']['why_reroute']}")
+    print(f"  ETA change : {reroute['old_eta_minutes']} min -> "
+          f"{reroute['new_eta_minutes']} min ({reroute['eta_delta_minutes']:+} min)")
+
+    # ------------------------------------------------------------------
+    step("14-15", "Dispatcher confirms the reroute; updated ETA and corridor")
+    reconfirmed = session.confirm_reroute()
+    print(f"  Confirmed: {' -> '.join(reconfirmed['confirmed_route']['node_names'])}")
+    print(f"  Updated ETA: {reconfirmed['updated_eta_minutes']} min")
+    for junction in reconfirmed["green_corridor"]["junctions"]:
+        print(f"    {junction['node_id']:<4} {junction['node_name']:<34} {junction['state']}")
+
+    print("\n  Completing the journey:")
+    while True:
+        tick = session.advance(1)
+        movement = tick["movements"][0]
+        if not movement["moved"]:
+            break
+        print(f"    {movement['from_name']} -> {movement['to_name']} "
+              f"(+{movement['segment_minutes']} min, "
+              f"{movement['remaining_eta_min']} min remaining)")
+        if movement["arrived"]:
+            break
+    final = session.state()
+    print(f"  Ambulance status: {final['ambulance']['status']} at "
+          f"{final['ambulance']['current_node']} after "
+          f"{final['ambulance']['elapsed_min']} min")
+
+    # ------------------------------------------------------------------
+    step("16", "History: the full decision trail (GET /history)")
+    for event in session.history_events()["events"]:
+        print(f"  {event['id']}  {event['event_type']:<20} {event['message']}")
 
 
 if __name__ == "__main__":
-    history = HistoryLog()
-    engine = RoutingEngine(history=history)
-
-    line("STEP 1-3: Dispatcher creates Priority-10 emergency, requests H3")
-    origin = "N1"  # Katpadi Junction
-    emergency = {
-        "id": "E001",
-        "origin": origin,
-        "needs": ["icu", "trauma"],
-        "priority": 10,
-        "preferred_hospital": "H3",  # Vellore Care Multispecialty - lacks ICU/trauma
-        "ambulance_id": "A01",
-    }
-    history.add("emergency_created", "Priority-10 emergency created at Katpadi Junction.", emergency_id="E001")
-    print(json.dumps(emergency, indent=2))
-
-    line("STEP 4-7: System checks H3, finds it unsuitable, recommends alternative + shows scores")
-    rec = engine.recommend(
-        origin=emergency["origin"],
-        needs=emergency["needs"],
-        priority=emergency["priority"],
-        preferred_hospital_id=emergency["preferred_hospital"],
-    )
-    show_recommendation(rec)
-
-    line("STEP 8-10: Dispatcher confirms dispatch, ambulance starts moving, green corridor activates")
-    node_path = rec["recommended_route"]["node_path"]
-    movement_log = engine.simulate_ambulance(emergency["ambulance_id"], node_path)
-    for m in movement_log:
-        print(f"  {m['from']} -> {m['to']}  "
-              f"(+{m['segment_eta_min']} min, cumulative {m['cumulative_eta_min']} min)  "
-              f"junction {m['green_corridor_junction']}: priority granted")
-
-    line("STEP 11: Dispatcher opens Chaos Mode, injects an accident on the active route")
-    active_edge_id = rec["recommended_route"]["edge_ids"][0]
-    engine.inject_accident(active_edge_id, severity="major", delay_penalty=30)
-    print(f"Accident injected on edge {active_edge_id} ({engine.edges[active_edge_id]['name']}).")
-
-    line("STEP 12-14: System recalculates routes, backup becomes recommended, dispatcher confirms")
-    current_node = node_path[0]  # ambulance still near the origin end of the affected edge
-    destination_node = rec["hospital"]["node"]
-    reroute_result = engine.reroute(current_node, destination_node, emergency["priority"])
-    if reroute_result:
-        best = reroute_result["recommended_route"]
-        print(f"NEW RECOMMENDED ROUTE: {engine.describe_route(best['node_path'])}")
-        print(f"  ETA {best['eta_min']} min | score {best['score']} | "
-              f"incident on route: {best['has_incident']}")
-        for alt in reroute_result["alternatives"]:
-            print(f"  Alternative -> {engine.describe_route(alt['node_path'])} "
-                  f"(ETA {alt['eta_min']} min, score {alt['score']})")
-
-    line("STEP 15-16: Updated ETA/route shown, full timestamped history")
-    print(json.dumps(history.as_list(), indent=2))
+    main()

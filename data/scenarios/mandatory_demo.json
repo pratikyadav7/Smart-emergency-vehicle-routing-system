@@ -1,0 +1,30 @@
+{
+  "id": "mandatory_demo",
+  "name": "Priority-10 ICU + Trauma with mid-transit accident",
+  "description": "The scripted hackathon demo. A critical patient is picked up at the VIT Vellore Gate. The dispatcher requests CMC Vellore (H1), but H1 has just gone to zero emergency beds, so medical eligibility rules it out and a suitable alternative is selected instead. After dispatch the ambulance clears one junction, an accident closes down the fast approach road, and the engine recalculates a backup route from the ambulance's current position.",
+  "emergency": {
+    "id": "E001",
+    "origin_node": "N2",
+    "priority": 10,
+    "requirements": ["icu", "trauma"],
+    "preferred_hospital_id": "H1",
+    "ambulance_id": "A01",
+    "description": "Road traffic accident, unconscious patient, suspected internal bleeding."
+  },
+  "setup_events": [
+    {
+      "type": "HOSPITAL_CAPACITY",
+      "hospital_id": "H1",
+      "emergency_beds": 0,
+      "accepting": false,
+      "description": "CMC Vellore emergency department on diversion - all resuscitation bays occupied."
+    }
+  ],
+  "advance_steps_before_chaos": 1,
+  "chaos_event": {
+    "type": "ACCIDENT",
+    "road_id": "R10",
+    "severity": "major",
+    "description": "Multi-vehicle collision blocking two lanes of the Katpadi-Gudiyatham Road."
+  }
+}

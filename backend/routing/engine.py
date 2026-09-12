@@ -1,411 +1,457 @@
 """
-Emergency Green-Corridor Planner
-Person C deliverable: Routing & Simulation Engine
+Emergency Green-Corridor Planner - routing & recommendation engine.
 
-Owns: road graph, route generation, hospital-route scoring, ambulance
-movement simulation, Chaos Mode, and dynamic rerouting.
+Person C deliverable. Owns the road graph, route generation, joint
+hospital-route scoring, and the recalculation that powers dynamic rerouting.
 
-Deterministic and explainable by design (no ML), per the 8-hour build plan.
-Returns plain dict/JSON objects so Person A (frontend) and Person B
-(AWS backend) can consume a stable contract:
+Design rules:
+  * Deterministic. No randomness, no ML - the same world state always yields
+    the same recommendation, which is what makes it explainable and testable.
+  * Never invents a destination or a route. Failure states are explicit
+    :class:`~backend.errors.EngineError` values, not fabricated data.
+  * Returns plain JSON-safe dicts, so Person A (frontend) and Person B (AWS)
+    depend on a contract, not on these classes.
 
-    {
-      "hospital": {...},
-      "recommended_route": {...},
-      "alternatives": [...],
-      "reasons": {...}
-    }
-
-Run this file directly for a self-contained demo:
-    python3 engine.py
+Both ``POST /analyze`` and ``POST /reroute`` are served by the same
+:meth:`RoutingEngine.recommend_candidates` core; ``reroute`` simply re-runs it
+from the ambulance's current node against the mutated world state.
 """
 
-import json
-import math
-import time
-import os
-import itertools
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Optional
 
-DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "data")
+from .. import config
+from ..errors import EngineError, ErrorCode
+from ..history import EventType, HistoryLog
+from ..models.emergency import Emergency
+from ..models.hospital import Hospital
+from .algorithms import Path, dijkstra, k_alternative_paths
+from .explanations import (
+    explain_alternative,
+    explain_hospital,
+    explain_preference_override,
+    explain_reroute,
+    explain_route,
+)
+from .graph import RoadGraph
+from .hospitals import (
+    EligibilityResult,
+    evaluate_eligibility,
+    load_hospitals,
+    validate_preferred_hospital,
+)
+from .scoring import RouteMetrics, ScoreBreakdown, compute_route_metrics, score_candidate
 
-TRAFFIC_SCORE = {"low": 100, "medium": 65, "high": 30}
-CAPACITY_SCORE = {"high": 100, "medium": 65, "low": 35}
 
+@dataclass
+class Candidate:
+    """One (hospital, route) pair with its metrics, score and explanation."""
 
-def haversine_km(lat1, lon1, lat2, lon2):
-    r = 6371.0
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlambda = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlambda / 2) ** 2
-    return 2 * r * math.asin(math.sqrt(a))
+    hospital: Hospital
+    path: Path
+    metrics: RouteMetrics
+    breakdown: ScoreBreakdown
+    route_id: str
+    node_names: List[str]
 
+    def sort_key(self):
+        """Deterministic ranking: score desc, then ETA asc, then stable ids."""
+        return (
+            -round(self.breakdown.total, 6),
+            round(self.metrics.eta_min, 6),
+            self.hospital.id,
+            tuple(self.path.road_ids),
+        )
 
-class HistoryLog:
-    """Timestamped event log -> feeds the History panel / audit trail."""
-
-    def __init__(self):
-        self.events = []
-        self._counter = itertools.count(1)
-
-    def add(self, event_type, message, **extra):
-        event = {
-            "id": f"EVT{next(self._counter):03d}",
-            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "event_type": event_type,
-            "message": message,
+    def to_dict(self, recommended: bool = False) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "route_id": self.route_id,
+            "hospital_id": self.hospital.id,
+            "hospital_name": self.hospital.name,
+            "nodes": list(self.path.nodes),
+            "node_names": list(self.node_names),
+            "edges": list(self.path.road_ids),
+            "score": round(self.breakdown.total, config.ROUND_DIGITS),
+            "score_breakdown": self.breakdown.to_dict(),
+            "recommended": recommended,
         }
-        event.update(extra)
-        self.events.append(event)
-        return event
-
-    def as_list(self):
-        return list(self.events)
+        payload.update(self.metrics.to_dict())
+        return payload
 
 
 class RoutingEngine:
-    def __init__(self, roads_path=None, hospitals_path=None, history: HistoryLog = None):
-        roads_path = roads_path or os.path.join(DATA_DIR, "roads.json")
-        hospitals_path = hospitals_path or os.path.join(DATA_DIR, "hospitals.json")
+    """Stateless-per-call recommendation engine over a mutable world state."""
 
-        with open(roads_path) as f:
-            road_data = json.load(f)
-        with open(hospitals_path) as f:
-            hosp_data = json.load(f)
+    def __init__(
+        self,
+        graph: Optional[RoadGraph] = None,
+        hospitals: Optional[Dict[str, Hospital]] = None,
+        history: Optional[HistoryLog] = None,
+        roads_path: Optional[str] = None,
+        hospitals_path: Optional[str] = None,
+    ) -> None:
+        self.graph = graph or RoadGraph.from_files(roads_path)
+        self.hospitals = hospitals if hospitals is not None else load_hospitals(hospitals_path)
+        self.history = history if history is not None else HistoryLog()
 
-        self.city = road_data.get("city")
-        self.nodes = {n["id"]: n for n in road_data["nodes"]}
-        self.edges = {e["id"]: e for e in road_data["edges"]}
-        self.hospitals = {h["id"]: h for h in hosp_data["hospitals"]}
-        self.history = history or HistoryLog()
+    # ------------------------------------------------------------------
+    # Hospital shortlisting (Dijkstra)
+    # ------------------------------------------------------------------
 
-        # adjacency list, built from edges (roads are bidirectional for this prototype)
-        self.adj = {n: [] for n in self.nodes}
-        for e in self.edges.values():
-            self.adj[e["from"]].append(e)
-            self.adj[e["to"]].append({**e, "from": e["to"], "to": e["from"]})
+    def shortlist_hospitals(
+        self,
+        origin: str,
+        eligible: Iterable[Hospital],
+        limit: int = config.HOSPITAL_SHORTLIST_SIZE,
+    ) -> List[Hospital]:
+        """Rank medically eligible hospitals by reachable travel time.
 
-    # ---------------------------------------------------------------
-    # Road graph helpers
-    # ---------------------------------------------------------------
+        One Dijkstra sweep prices every destination in the network at once,
+        which is why it is the right tool for shortlisting; A* then computes
+        the actual path to the destinations that survive.
+        """
+        distances, _ = dijkstra(self.graph, origin)
+        reachable = [h for h in eligible if h.node in distances]
+        reachable.sort(key=lambda h: (round(distances[h.node], 6), h.id))
+        return reachable[:limit]
 
-    def edge_distance_km(self, edge):
-        a, b = self.nodes[edge["from"]], self.nodes[edge["to"]]
-        return haversine_km(a["lat"], a["lon"], b["lat"], b["lon"])
+    # ------------------------------------------------------------------
+    # Candidate generation + joint scoring
+    # ------------------------------------------------------------------
 
-    def edge_eta_min(self, edge):
-        dist = self.edge_distance_km(edge)
-        speed = max(edge["speed_kmph"], 5)
-        return (dist / speed) * 60
-
-    # ---------------------------------------------------------------
-    # Route generation (simple-paths search, capped, closed roads excluded)
-    # ---------------------------------------------------------------
-
-    def find_routes(self, origin, destination, max_routes=3, max_hops=6):
-        if origin not in self.nodes or destination not in self.nodes:
-            return []
-
-        results = []
-
-        def dfs(current, target, path, edges_used, visited):
-            if len(results) >= max_routes * 4:  # safety cap on search
-                return
-            if len(path) - 1 > max_hops:
-                return
-            if current == target:
-                results.append(list(edges_used))
-                return
-            for edge in self.adj[current]:
-                nxt = edge["to"]
-                if edge["status"] == "closed":
-                    continue
-                if nxt in visited:
-                    continue
-                visited.add(nxt)
-                path.append(nxt)
-                edges_used.append(edge)
-                dfs(nxt, target, path, edges_used, visited)
-                path.pop()
-                edges_used.pop()
-                visited.remove(nxt)
-
-        dfs(origin, destination, [origin], [], {origin})
-
-        # dedupe by node sequence, sort by raw distance, keep shortest few
-        seen = set()
-        unique = []
-        for edges in results:
-            seq = tuple(e["id"] for e in edges)
-            if seq in seen:
-                continue
-            seen.add(seq)
-            unique.append(edges)
-
-        unique.sort(key=lambda edges: sum(self.edge_distance_km(e) for e in edges))
-        return unique[:max_routes]
-
-    # ---------------------------------------------------------------
-    # Scoring
-    # ---------------------------------------------------------------
-
-    def score_route(self, edges, priority):
-        """Score a single route (list of edge dicts). Higher = better."""
-        total_dist = sum(self.edge_distance_km(e) for e in edges)
-        total_eta = sum(self.edge_eta_min(e) for e in edges)
-
-        traffic_scores = [TRAFFIC_SCORE.get(e["traffic"], 50) for e in edges]
-        safety_scores = [e["safety"] for e in edges]
-        capacity_scores = [CAPACITY_SCORE.get(e["capacity"], 50) for e in edges]
-
-        avg_traffic = sum(traffic_scores) / len(traffic_scores)
-        avg_safety = sum(safety_scores) / len(safety_scores)
-        avg_capacity = sum(capacity_scores) / len(capacity_scores)
-
-        # ETA score: shorter is better, normalised against a 30-min ceiling
-        eta_score = max(0, 100 - (total_eta / 30) * 100)
-
-        incidents = [e for e in edges if e.get("incident")]
-        incident_penalty = sum(e["incident"].get("delay_penalty", 0) for e in incidents)
-
-        # Weights shift with priority (Section 5 of the PDF proposal):
-        # high-priority cases weight medical fit / travel time harder;
-        # low-priority cases let safety / traffic carry more weight.
-        if priority >= 7:
-            w = {"eta": 0.40, "traffic": 0.15, "safety": 0.15, "capacity": 0.10}
-        elif priority <= 3:
-            w = {"eta": 0.25, "traffic": 0.20, "safety": 0.30, "capacity": 0.10}
-        else:
-            w = {"eta": 0.35, "traffic": 0.15, "safety": 0.20, "capacity": 0.10}
-
-        base = (
-            eta_score * w["eta"]
-            + avg_traffic * w["traffic"]
-            + avg_safety * w["safety"]
-            + avg_capacity * w["capacity"]
-        )
-        score = round(max(0, base - incident_penalty), 1)
-
-        return {
-            "distance_km": round(total_dist, 2),
-            "eta_min": round(total_eta, 1),
-            "avg_traffic_score": round(avg_traffic, 1),
-            "avg_safety_score": round(avg_safety, 1),
-            "avg_capacity_score": round(avg_capacity, 1),
-            "incident_penalty": incident_penalty,
-            "score": score,
-            "has_incident": bool(incidents),
-            "node_path": [edges[0]["from"]] + [e["to"] for e in edges] if edges else [],
-            "edge_ids": [e["id"] for e in edges],
-        }
-
-    def describe_route(self, node_path):
-        names = [self.nodes[n]["name"] for n in node_path]
-        return " -> ".join(names)
-
-    # ---------------------------------------------------------------
-    # Hospital eligibility
-    # ---------------------------------------------------------------
-
-    def eligible_hospitals(self, needs):
-        """needs: set of {'icu','trauma','cardiac'} required capabilities."""
-        eligible = []
-        for h in self.hospitals.values():
-            if not h["accepting"] or h["emergency_beds"] <= 0:
-                continue
-            if "icu" in needs and not h["icu_available"]:
-                continue
-            if "trauma" in needs and not h["trauma_available"]:
-                continue
-            if "cardiac" in needs and not h["cardiac_available"]:
-                continue
-            eligible.append(h)
-        return eligible
-
-    # ---------------------------------------------------------------
-    # Full recommendation: hospital + route, jointly
-    # ---------------------------------------------------------------
-
-    def recommend(self, origin, needs, priority, preferred_hospital_id=None):
-        needs = set(needs)
-        eligible = self.eligible_hospitals(needs)
-
-        warning = None
-        if preferred_hospital_id:
-            preferred = self.hospitals.get(preferred_hospital_id)
-            if preferred and preferred not in eligible:
-                reason_bits = []
-                if not preferred["accepting"] or preferred["emergency_beds"] <= 0:
-                    reason_bits.append("no emergency capacity")
-                if "icu" in needs and not preferred["icu_available"]:
-                    reason_bits.append("no ICU")
-                if "trauma" in needs and not preferred["trauma_available"]:
-                    reason_bits.append("no trauma capability")
-                if "cardiac" in needs and not preferred["cardiac_available"]:
-                    reason_bits.append("no cardiac capability")
-                warning = (
-                    f"Preferred hospital {preferred['name']} cannot be used: "
-                    f"{', '.join(reason_bits)}."
+    def _build_candidates(
+        self,
+        origin: str,
+        emergency: Emergency,
+        hospitals: Iterable[Hospital],
+        exclude_roads: Optional[Iterable[str]] = None,
+    ) -> List[Candidate]:
+        candidates: List[Candidate] = []
+        for hospital in hospitals:
+            paths = k_alternative_paths(
+                self.graph,
+                origin,
+                hospital.node,
+                k=config.MAX_ROUTES_PER_HOSPITAL,
+                blocked_roads=exclude_roads,
+            )
+            for index, path in enumerate(paths, start=1):
+                metrics = compute_route_metrics(self.graph, path)
+                breakdown = score_candidate(hospital, metrics, emergency)
+                candidates.append(
+                    Candidate(
+                        hospital=hospital,
+                        path=path,
+                        metrics=metrics,
+                        breakdown=breakdown,
+                        route_id=f"R-{hospital.id}-{index}",
+                        node_names=[self.graph.node_name(n) for n in path.nodes],
+                    )
                 )
-                self.history.add(
-                    "hospital_rejected", warning, hospital_id=preferred_hospital_id
-                )
+        candidates.sort(key=Candidate.sort_key)
+        return candidates
 
-        if not eligible:
-            self.history.add("no_feasible_option", "No suitable hospital available for these needs.")
-            return {
-                "hospital": None,
-                "recommended_route": None,
-                "alternatives": [],
-                "reasons": {"warning": warning, "explanation": "No hospital currently meets the required medical capabilities."},
-            }
+    def recommend_candidates(
+        self,
+        emergency: Emergency,
+        origin: Optional[str] = None,
+        exclude_roads: Optional[Iterable[str]] = None,
+        limit: int = config.MAX_CANDIDATE_ROUTES,
+    ) -> Dict[str, Any]:
+        """Core pipeline shared by ``/analyze`` and ``/reroute``.
 
-        candidates = []
-        for hosp in eligible:
-            routes = self.find_routes(origin, hosp["node"])
-            for edges in routes:
-                scored = self.score_route(edges, priority)
-                # soft preference bonus, applied only after suitability passes
-                preference_bonus = 8 if preferred_hospital_id == hosp["id"] else 0
-                combined_score = round(scored["score"] + preference_bonus, 1)
-                candidates.append({"hospital": hosp, "route": scored, "combined_score": combined_score})
+        validate -> medical eligibility -> Dijkstra shortlist -> A* routes ->
+        joint scoring -> ranking. Raises :class:`EngineError` rather than
+        returning an empty or invented recommendation.
+        """
+        origin = origin or emergency.origin_node
+        if not self.graph.has_node(origin):
+            raise EngineError(
+                ErrorCode.UNKNOWN_NODE,
+                f"Origin node {origin!r} is not part of the road network.",
+                node_id=origin,
+            )
+        validate_preferred_hospital(self.hospitals, emergency)
 
+        eligibility = evaluate_eligibility(self.hospitals.values(), emergency)
+        if not eligibility.has_eligible:
+            raise EngineError(
+                ErrorCode.NO_ELIGIBLE_HOSPITAL,
+                "No hospital currently meets the required medical capabilities.",
+                requirements=list(emergency.requirements),
+                rejected=eligibility.rejected,
+            )
+
+        shortlist = self.shortlist_hospitals(origin, eligibility.eligible)
+        if not shortlist:
+            raise EngineError(
+                ErrorCode.NO_FEASIBLE_ROUTE,
+                "No medically suitable hospital is reachable from the current position.",
+                origin=origin,
+                eligible=[h.id for h in eligibility.eligible],
+            )
+
+        candidates = self._build_candidates(origin, emergency, shortlist, exclude_roads)
         if not candidates:
-            self.history.add("no_route", "No route exists to any suitable hospital.")
+            raise EngineError(
+                ErrorCode.NO_FEASIBLE_ROUTE,
+                "Every route to a suitable hospital is currently closed or blocked.",
+                origin=origin,
+                closed_roads=self.graph.closed_roads(),
+            )
+
+        return {
+            "eligibility": eligibility,
+            "candidates": candidates[:limit],
+            "all_candidates": candidates,
+            "origin": origin,
+        }
+
+    # ------------------------------------------------------------------
+    # POST /analyze
+    # ------------------------------------------------------------------
+
+    def analyze(
+        self,
+        emergency: Emergency,
+        origin: Optional[str] = None,
+        log: bool = True,
+    ) -> Dict[str, Any]:
+        """Full recommendation payload for ``POST /analyze`` (JSON-safe)."""
+        result = self.recommend_candidates(emergency, origin=origin)
+        eligibility: EligibilityResult = result["eligibility"]
+        candidates: List[Candidate] = result["candidates"]
+
+        best = candidates[0]
+        alternatives = candidates[1:]
+
+        recommended_route = best.to_dict(recommended=True)
+        alternative_routes = [c.to_dict() for c in alternatives]
+
+        warning = explain_preference_override(eligibility.preferred_rejected)
+        if warning and log:
+            self.history.add(
+                EventType.HOSPITAL_REJECTED,
+                warning,
+                hospital_id=emergency.preferred_hospital_id,
+            )
+
+        why_not = {
+            alt["route_id"]: explain_alternative(alt, recommended_route)
+            for alt in alternative_routes
+        }
+
+        payload = {
+            "status": "ok",
+            "emergency": emergency.to_dict(),
+            "origin_node": result["origin"],
+            "hospital": best.hospital.to_dict(),
+            "recommended_route": recommended_route,
+            "alternatives": alternative_routes,
+            "routes": [recommended_route] + alternative_routes,
+            "eligibility": {
+                "eligible_hospitals": [h.to_dict() for h in eligibility.eligible],
+                "rejected_hospitals": eligibility.rejected,
+                "preferred_hospital_used": (
+                    emergency.preferred_hospital_id == best.hospital.id
+                    if emergency.preferred_hospital_id
+                    else None
+                ),
+            },
+            "reasons": {
+                "why_this_hospital": explain_hospital(best.hospital, emergency),
+                "why_this_route": explain_route(
+                    best.metrics, best.breakdown, best.node_names
+                ),
+                "why_not_alternatives": why_not,
+                "rejected_hospitals": [r["detail"] for r in eligibility.rejected],
+                "warning": warning,
+            },
+            "environment": {
+                "closed_roads": self.graph.closed_roads(),
+                "active_incidents": self.graph.active_incidents(),
+            },
+        }
+
+        if log:
+            self.history.add(
+                EventType.RECOMMENDATION,
+                f"Recommended {best.hospital.name} via {' -> '.join(best.node_names)} "
+                f"(score {recommended_route['score']}, ETA {recommended_route['eta_minutes']} min).",
+                emergency_id=emergency.id,
+                hospital_id=best.hospital.id,
+                route_id=best.route_id,
+                eta_minutes=recommended_route["eta_minutes"],
+                score=recommended_route["score"],
+            )
+        return payload
+
+    # ------------------------------------------------------------------
+    # POST /reroute
+    # ------------------------------------------------------------------
+
+    def reroute(
+        self,
+        emergency: Emergency,
+        current_node: str,
+        current_route: Optional[Dict[str, Any]] = None,
+        trigger: Optional[Dict[str, Any]] = None,
+        log: bool = True,
+    ) -> Dict[str, Any]:
+        """Recalculate from the ambulance's *current* position and world state.
+
+        This is a genuine re-run of the same pipeline against the mutated
+        graph - there is no "if accident then take route 3" shortcut anywhere.
+        The previous route is re-measured under current conditions so the
+        before/after comparison is honest.
+        """
+        analysis = self.analyze(emergency, origin=current_node, log=False)
+        new_route = analysis["recommended_route"]
+
+        # Compare like with like: the old plan's *remaining* leg from where the
+        # ambulance actually is, not the whole route it started on.
+        remaining_old = self._remaining_route(current_route, current_node)
+        old_route = self._remeasure(remaining_old, emergency) if remaining_old else None
+        old_eta = old_route["eta_minutes"] if old_route else None
+
+        destination_changed = bool(
+            current_route
+            and current_route.get("hospital_id")
+            and current_route["hospital_id"] != new_route["hospital_id"]
+        )
+        route_changed = bool(
+            old_route is None or old_route.get("edges") != new_route["edges"]
+        )
+
+        explanation = (
+            explain_reroute(
+                old_route or new_route,
+                new_route,
+                trigger,
+                destination_changed,
+                analysis["hospital"]["name"],
+            )
+            if route_changed
+            else (
+                "Conditions changed but the current route is still the best available option; "
+                f"ETA is now {new_route['eta_minutes']} minutes."
+            )
+        )
+
+        payload = {
+            "status": "ok",
+            "rerouted": route_changed,
+            "destination_changed": destination_changed,
+            "from_node": current_node,
+            "old_route": old_route,
+            "new_route": new_route,
+            "recommended_route": new_route,
+            "alternatives": analysis["alternatives"],
+            "hospital": analysis["hospital"],
+            "old_eta_minutes": old_eta,
+            "new_eta_minutes": new_route["eta_minutes"],
+            "eta_delta_minutes": (
+                round(new_route["eta_minutes"] - old_eta, config.ROUND_DIGITS)
+                if old_eta is not None
+                else None
+            ),
+            "trigger": trigger,
+            "changed_conditions": {
+                "closed_roads": self.graph.closed_roads(),
+                "active_incidents": self.graph.active_incidents(),
+            },
+            "reasons": {
+                "why_reroute": explanation,
+                "why_this_hospital": analysis["reasons"]["why_this_hospital"],
+                "why_this_route": analysis["reasons"]["why_this_route"],
+                "why_not_alternatives": analysis["reasons"]["why_not_alternatives"],
+            },
+        }
+
+        if log:
+            self.history.add(
+                EventType.REROUTE_PROPOSED if route_changed else EventType.RECOMMENDATION,
+                explanation,
+                emergency_id=emergency.id,
+                hospital_id=analysis["hospital"]["id"],
+                route_id=new_route["route_id"],
+                old_eta_minutes=old_eta,
+                new_eta_minutes=new_route["eta_minutes"],
+            )
+        return payload
+
+    @staticmethod
+    def _remaining_route(
+        route: Optional[Dict[str, Any]], current_node: str
+    ) -> Optional[Dict[str, Any]]:
+        """Trim a route to the leg the ambulance has not driven yet.
+
+        Returns ``None`` when the ambulance is not on the route at all (for
+        example after an earlier reroute), in which case there is no honest
+        before/after comparison to make.
+        """
+        if not route:
+            return None
+        nodes = list(route.get("nodes") or [])
+        road_ids = list(route.get("edges") or route.get("roads") or [])
+        if current_node not in nodes:
+            return None
+        index = nodes.index(current_node)
+        if index >= len(nodes) - 1:
+            return None  # already at the destination of the old route
+        return {
+            **route,
+            "nodes": nodes[index:],
+            "edges": road_ids[index:],
+        }
+
+    def _remeasure(
+        self, route: Dict[str, Any], emergency: Emergency
+    ) -> Optional[Dict[str, Any]]:
+        """Re-price a previously recommended route under current conditions.
+
+        Returns ``None`` when the old route is no longer traversable, which is
+        itself the answer: a closed road makes the old route infeasible.
+        """
+        road_ids = list(route.get("edges") or route.get("roads") or [])
+        nodes = list(route.get("nodes") or [])
+        if not road_ids or not nodes:
+            return None
+        try:
+            roads = [self.graph.road(rid) for rid in road_ids]
+        except EngineError:
+            return None
+        if any(not r.is_open for r in roads):
             return {
-                "hospital": None,
-                "recommended_route": None,
-                "alternatives": [],
-                "reasons": {"warning": warning, "explanation": "No route could be found to a suitable hospital."},
+                "route_id": route.get("route_id"),
+                "nodes": nodes,
+                "edges": road_ids,
+                "feasible": False,
+                "eta_minutes": None,
+                "reason": "One or more roads on this route are closed.",
             }
 
-        candidates.sort(key=lambda c: c["combined_score"], reverse=True)
-        best = candidates[0]
-        alternatives = candidates[1:4]
-
-        reasons = self._build_explanation(best, alternatives, preferred_hospital_id, warning)
-
-        self.history.add(
-            "recommendation",
-            f"Recommended {best['hospital']['name']} via "
-            f"{self.describe_route(best['route']['node_path'])} "
-            f"(score {best['combined_score']}, ETA {best['route']['eta_min']} min).",
-            hospital_id=best["hospital"]["id"],
+        path = Path(
+            nodes=nodes,
+            road_ids=road_ids,
+            distance_km=sum(r.distance_km for r in roads),
+            travel_time_min=sum(self.graph.travel_time_min(r) for r in roads),
         )
-
-        return {
-            "hospital": best["hospital"],
-            "recommended_route": best["route"],
-            "alternatives": [{"hospital": c["hospital"], "route": c["route"], "combined_score": c["combined_score"]} for c in alternatives],
-            "reasons": reasons,
+        hospital = self.hospitals.get(route.get("hospital_id"))
+        metrics = compute_route_metrics(self.graph, path)
+        payload: Dict[str, Any] = {
+            "route_id": route.get("route_id"),
+            "nodes": nodes,
+            "edges": road_ids,
+            "feasible": True,
+            "node_names": [self.graph.node_name(n) for n in nodes],
         }
+        payload.update(metrics.to_dict())
+        if hospital is not None:
+            breakdown = score_candidate(hospital, metrics, emergency)
+            payload["hospital_id"] = hospital.id
+            payload["hospital_name"] = hospital.name
+            payload["score"] = round(breakdown.total, config.ROUND_DIGITS)
+            payload["score_breakdown"] = breakdown.to_dict()
+        return payload
 
-    def _build_explanation(self, best, alternatives, preferred_hospital_id, warning):
-        why_hospital = (
-            f"{best['hospital']['name']} has the required facilities available and is "
-            f"currently accepting emergencies."
-        )
-        why_route = (
-            f"ETA {best['route']['eta_min']} min, traffic score {best['route']['avg_traffic_score']}, "
-            f"safety score {best['route']['avg_safety_score']}, "
-            f"{'an active incident is present' if best['route']['has_incident'] else 'no active incident'}."
-        )
-        why_not = {}
-        for c in alternatives:
-            tag = f"{c['hospital']['name']} via {c['route']['edge_ids']}"
-            if c["route"]["has_incident"]:
-                why_not[tag] = "affected by an active incident."
-            elif c["route"]["eta_min"] > best["route"]["eta_min"]:
-                why_not[tag] = f"feasible, but slower ({c['route']['eta_min']} min vs {best['route']['eta_min']} min)."
-            else:
-                why_not[tag] = "feasible, but scored lower overall."
-
-        return {
-            "why_this_hospital": why_hospital,
-            "why_this_route": why_route,
-            "why_not_alternatives": why_not,
-            "warning": warning,
-        }
-
-    # ---------------------------------------------------------------
-    # Chaos Mode
-    # ---------------------------------------------------------------
-
-    def inject_accident(self, edge_id, severity="major", delay_penalty=25):
-        edge = self.edges[edge_id]
-        edge["incident"] = {"type": "accident", "severity": severity, "delay_penalty": delay_penalty}
-        edge["traffic"] = "high"
-        self.history.add("chaos_accident", f"Accident injected on {edge['name']} ({edge_id}).", edge_id=edge_id)
-
-    def inject_closure(self, edge_id):
-        edge = self.edges[edge_id]
-        edge["status"] = "closed"
-        self.history.add("chaos_closure", f"{edge['name']} ({edge_id}) marked closed.", edge_id=edge_id)
-
-    def inject_traffic_spike(self, edge_id):
-        edge = self.edges[edge_id]
-        edge["traffic"] = "high"
-        self.history.add("chaos_traffic", f"Traffic spike on {edge['name']} ({edge_id}).", edge_id=edge_id)
-
-    def inject_hospital_full(self, hospital_id):
-        h = self.hospitals[hospital_id]
-        h["emergency_beds"] = 0
-        self.history.add("chaos_hospital_full", f"{h['name']} reports 0 emergency beds.", hospital_id=hospital_id)
-
-    def clear_chaos(self, edge_id=None):
-        if edge_id:
-            self.edges[edge_id].pop("incident", None)
-
-    # ---------------------------------------------------------------
-    # Ambulance movement simulation
-    # ---------------------------------------------------------------
-
-    def simulate_ambulance(self, ambulance_id, node_path):
-        """Produces a timestamped, node-by-node movement log (used to drive
-        the Live Map / Green Corridor panel on the frontend)."""
-        log = []
-        cumulative_min = 0
-        for i in range(len(node_path) - 1):
-            edge = self._find_edge(node_path[i], node_path[i + 1])
-            eta = self.edge_eta_min(edge)
-            cumulative_min += eta
-            log.append({
-                "ambulance_id": ambulance_id,
-                "from": self.nodes[node_path[i]]["name"],
-                "to": self.nodes[node_path[i + 1]]["name"],
-                "segment_eta_min": round(eta, 1),
-                "cumulative_eta_min": round(cumulative_min, 1),
-                "green_corridor_junction": node_path[i + 1],
-                "priority_granted": True,
-            })
-        self.history.add(
-            "ambulance_dispatched",
-            f"Ambulance {ambulance_id} en route: {self.describe_route(node_path)}.",
-            ambulance_id=ambulance_id,
-        )
-        return log
-
-    def _find_edge(self, a, b):
-        for e in self.adj[a]:
-            if e["to"] == b:
-                return e
-        raise ValueError(f"No edge between {a} and {b}")
-
-    # ---------------------------------------------------------------
-    # Reroute (after a Chaos Mode event mid-transit)
-    # ---------------------------------------------------------------
-
-    def reroute(self, current_node, destination_node, priority):
-        routes = self.find_routes(current_node, destination_node)
-        if not routes:
-            self.history.add("reroute_failed", "No alternative route available.")
-            return None
-        scored = [self.score_route(edges, priority) for edges in routes]
-        scored.sort(key=lambda s: s["score"], reverse=True)
-        best = scored[0]
-        self.history.add(
-            "reroute_proposed",
-            f"New recommended route: {self.describe_route(best['node_path'])} "
-            f"(score {best['score']}, ETA {best['eta_min']} min).",
-        )
-        return {"recommended_route": best, "alternatives": scored[1:3]}
