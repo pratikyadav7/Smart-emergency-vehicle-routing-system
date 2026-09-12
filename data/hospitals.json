@@ -1,0 +1,35 @@
+{
+  "note": "Hospital identities and locations are real Vellore facilities. Bed counts / live availability are simulated for the hackathon prototype.",
+  "hospitals": [
+    {
+      "id": "H1",
+      "name": "CMC Vellore (Christian Medical College)",
+      "node": "N5",
+      "emergency_beds": 6,
+      "icu_available": true,
+      "trauma_available": true,
+      "cardiac_available": true,
+      "accepting": true
+    },
+    {
+      "id": "H2",
+      "name": "Government Vellore Medical College Hospital",
+      "node": "N9",
+      "emergency_beds": 4,
+      "icu_available": true,
+      "trauma_available": true,
+      "cardiac_available": false,
+      "accepting": true
+    },
+    {
+      "id": "H3",
+      "name": "Vellore Care Multispecialty Hospital",
+      "node": "N6",
+      "emergency_beds": 2,
+      "icu_available": false,
+      "trauma_available": false,
+      "cardiac_available": false,
+      "accepting": true
+    }
+  ]
+}
