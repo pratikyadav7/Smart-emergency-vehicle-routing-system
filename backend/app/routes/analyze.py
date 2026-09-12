@@ -1,13 +1,9 @@
 from fastapi import APIRouter
+from backend.app.services.analyze_service import analyze_route
 
 router = APIRouter()
 
 
 @router.get("/analyze")
 def analyze():
-    return {
-        "best_hospital": "Apollo Hospital",
-        "eta_minutes": 12,
-        "route_score": 95,
-        "status": "Route analyzed successfully"
-    }
+    return analyze_route()
