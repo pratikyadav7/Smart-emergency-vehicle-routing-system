@@ -7,5 +7,5 @@ router = APIRouter()
 
 
 @router.post("/emergencies")
-def create_emergency(emergency: EmergencyRequest):
+def create_emergency_route(emergency: EmergencyRequest):
     return create_emergency(emergency.model_dump())
