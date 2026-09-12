@@ -1,12 +1,9 @@
 from fastapi import APIRouter
+from backend.app.services.state_service import get_state
 
 router = APIRouter()
 
 
 @router.get("/state")
-def get_state():
-    return {
-        "system_status": "healthy",
-        "active_emergencies": 0,
-        "message": "Emergency Green Corridor System is running"
-    }
+def state():
+    return get_state()
