@@ -2,12 +2,14 @@ from fastapi import FastAPI
 from backend.app.routes.analyze import router as analyze_router
 from backend.app.routes.emergency import router as emergency_router
 from backend.app.routes.state import router as state_router
+from backend.app.routes.history import router as history_router
 
 app = FastAPI()
 
 app.include_router(emergency_router)
 app.include_router(state_router)
 app.include_router(analyze_router)
+app.include_router(history_router)
 
 
 @app.get("/")
