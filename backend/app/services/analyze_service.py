@@ -1,4 +1,5 @@
 from backend.app.services.database import emergencies
+from backend.app.services.hospital_service import get_best_hospital
 
 
 def analyze_route():
@@ -8,23 +9,22 @@ def analyze_route():
         }
 
     latest = emergencies[-1]
-
     priority = latest.get("priority", 1)
 
-    if priority >= 8:
-        eta = 8
-        hospital = "Apollo Hospital"
-    elif priority >= 5:
-        eta = 12
-        hospital = "City Hospital"
-    else:
-        eta = 18
-        hospital = "General Hospital"
+    hospital = get_best_hospital(priority)
+
+    if hospital is None:
+        return {
+            "status": "failed",
+            "message": "No hospital available"
+        }
+
+    eta = hospital["distance"]
 
     return {
         "patient": latest["patient_name"],
         "priority": priority,
-        "best_hospital": hospital,
+        "best_hospital": hospital["name"],
         "estimated_eta": eta,
         "status": "Analysis Complete"
     }
