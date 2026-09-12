@@ -6,6 +6,7 @@ from backend.app.routes.history import router as history_router
 from backend.app.routes.dispatch import router as dispatch_router
 from backend.app.routes.reroute import router as reroute_router
 from backend.app.routes.chaos import router as chaos_router
+from backend.app.routes.hospital import router as hospital_router
 
 app = FastAPI()
 
@@ -16,6 +17,7 @@ app.include_router(history_router)
 app.include_router(dispatch_router)
 app.include_router(reroute_router)
 app.include_router(chaos_router)
+app.include_router(hospital_router)
 
 
 @app.get("/")
